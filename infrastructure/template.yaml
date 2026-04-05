@@ -1,0 +1,593 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: E-Commerce Backend - Complete Infrastructure
+
+Parameters:
+  AdminEmail:
+    Type: String
+    Description: Email for admin notifications
+  FromEmail:
+    Type: String
+    Description: From email address for SES
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: python3.9
+    Tracing: Active
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        POWERTOOLS_SERVICE_NAME: ecommerce-backend
+        POWERTOOLS_METRICS_NAMESPACE: ECommerce
+
+Resources:
+  # ============================================
+  # 1. AUTHENTICATION - Cognito
+  # ============================================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${Environment}-ecommerce-users
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+  
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub ${Environment}-ecommerce-client
+      GenerateSecret: false
+      AccessTokenValidity: 1
+      RefreshTokenValidity: 30
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlows:
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      CallbackURLs:
+        - http://localhost:3000/callback
+
+  # ============================================
+  # 2. PRODUCT CATALOG - DynamoDB & S3
+  # ============================================
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${Environment}-products
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+        - AttributeName: category
+          AttributeType: S
+        - AttributeName: price
+          AttributeType: N
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CategoryIndex
+          KeySchema:
+            - AttributeName: category
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: PriceIndex
+          KeySchema:
+            - AttributeName: category
+              KeyType: HASH
+            - AttributeName: price
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+  
+  ProductsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${Environment}-ecommerce-products-${AWS::AccountId}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - "*"
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+            AllowedHeaders:
+              - "*"
+            MaxAge: 3000
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ============================================
+  # 3. ORDER PROCESSING - DynamoDB & SQS
+  # ============================================
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${Environment}-orders
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserOrdersIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  OrderQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Environment}-order-queue-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  OrderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Environment}-order-queue
+      VisibilityTimeout: 300  # 5 minutes
+      MessageRetentionPeriod: 345600  # 4 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderQueueDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # 4. PAYMENTS - DynamoDB Table
+  # ============================================
+  PaymentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${Environment}-payments
+      AttributeDefinitions:
+        - AttributeName: paymentId
+          AttributeType: S
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: paymentId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: OrderPaymentIndex
+          KeySchema:
+            - AttributeName: orderId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+
+  # ============================================
+  # 5. NOTIFICATIONS - SNS Topics
+  # ============================================
+  OrderNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${Environment}-order-notifications
+      DisplayName: E-Commerce Order Notifications
+
+  AlertSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${Environment}-alerts
+
+  # Email subscription (comment out initially, subscribe manually)
+  # EmailSubscription:
+  #   Type: AWS::SNS::Subscription
+  #   Properties:
+  #     TopicArn: !Ref OrderNotificationsTopic
+  #     Protocol: email
+  #     Endpoint: !Ref AdminEmail
+
+  # ============================================
+  # 6. API Gateway
+  # ============================================
+  EcommerceAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${Environment}-ecommerce-api
+      StageName: prod
+      TracingEnabled: true
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+            IdentitySource: method.request.header.Authorization
+      EndpointConfiguration: REGIONAL
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: 1000
+          ThrottlingBurstLimit: 2000
+          LoggingLevel: INFO
+          MetricsEnabled: true
+
+  # ============================================
+  # 7. LAMBDA FUNCTIONS
+  # ============================================
+  
+  # 7a. Product Functions
+  AddProductFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-add-product
+      CodeUri: ../services/products/
+      Handler: add_product.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProductsTable
+        - S3CrudPolicy:
+            BucketName: !Ref ProductsBucket
+      Environment:
+        Variables:
+          PRODUCTS_TABLE: !Ref ProductsTable
+          PRODUCTS_BUCKET: !Ref ProductsBucket
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EcommerceAPI
+            Path: /products
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  ListProductsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-list-products
+      CodeUri: ../services/products/
+      Handler: list_products.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ProductsTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EcommerceAPI
+            Path: /products
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # 7b. Order Functions
+  PlaceOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-place-order
+      CodeUri: ../services/orders/
+      Handler: place_order.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OrderQueue.QueueName
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          ORDER_QUEUE_URL: !Ref OrderQueue
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref EcommerceAPI
+            Path: /orders
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  OrderWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-order-worker
+      CodeUri: ../services/orders/
+      Handler: order_worker.lambda_handler
+      Policies:
+        - DynamoDBUpdatePolicy:
+            TableName: !Ref OrdersTable
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !Ref OrderProcessingStateMachine
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          STATE_MACHINE_ARN: !Ref OrderProcessingStateMachine
+      Events:
+        SQS:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 60
+
+  # 7c. Payment Functions
+  ProcessPaymentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-process-payment
+      CodeUri: ../services/payments/
+      Handler: process_payment.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTable
+      Environment:
+        Variables:
+          PAYMENTS_TABLE: !Ref PaymentsTable
+
+  # 7d. Notification Function
+  NotificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-send-notification
+      CodeUri: ../services/notifications/
+      Handler: send_notification.lambda_handler
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt OrderNotificationsTopic.TopicName
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref OrderNotificationsTopic
+          SES_FROM_EMAIL: !Ref FromEmail
+      Events:
+        SNS:
+          Type: SNS
+          Properties:
+            Topic: !Ref OrderNotificationsTopic
+
+  # ============================================
+  # 8. STEP FUNCTIONS
+  # ============================================
+  OrderProcessingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub ${Environment}-order-processing
+      DefinitionUri: ../statemachines/order-workflow.json
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ProcessPaymentFunction
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt OrderNotificationsTopic.TopicName
+      Tracing:
+        Enabled: true
+      Events:
+        OrderPlaced:
+          Type: Api
+          Properties:
+            Path: /orders/process
+            Method: POST
+            RestApiId: !Ref EcommerceAPI
+
+  # ============================================
+  # 9. EVENTBRIDGE RULES (Scheduled Jobs)
+  # ============================================
+  DailyOrderSummaryRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${Environment}-daily-order-summary
+      ScheduleExpression: "cron(0 9 * * ? *)"
+      Targets:
+        - Arn: !GetAtt OrderSummaryFunction.Arn
+          Id: OrderSummaryTarget
+      State: ENABLED
+
+  ExpiredCartCleanupRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${Environment}-expired-cart-cleanup
+      ScheduleExpression: "rate(1 hour)"
+      Targets:
+        - Arn: !GetAtt CleanupCartsFunction.Arn
+          Id: CartCleanupTarget
+      State: ENABLED
+
+  OrderSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-order-summary
+      CodeUri: ../services/jobs/
+      Handler: order_summary.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrdersTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertSNSTopic.TopicName
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          REPORT_TOPIC_ARN: !Ref AlertSNSTopic
+
+  CleanupCartsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-cleanup-carts
+      CodeUri: ../services/jobs/
+      Handler: cleanup_carts.lambda_handler
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref CartsTable
+      Environment:
+        Variables:
+          CARTS_TABLE: !Ref CartsTable
+
+  # Grant EventBridge permission to invoke Lambda
+  OrderSummaryInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderSummaryFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyOrderSummaryRule.Arn
+
+  # ============================================
+  # 10. SHOPPING CART (Bonus)
+  # ============================================
+  CartsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${Environment}-carts
+      AttributeDefinitions:
+        - AttributeName: cartId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cartId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserCartIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ============================================
+  # 11. CLOUDWATCH ALARMS
+  # ============================================
+  OrderQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-order-queue-depth-alarm
+      AlarmDescription: Alert when order queue depth > 100
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertSNSTopic
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrderQueue.QueueName
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-order-worker-errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OrderWorkerFunction
+      AlarmActions:
+        - !Ref AlertSNSTopic
+
+# ============================================
+# OUTPUTS
+# ============================================
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${Environment}-UserPoolId
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub ${Environment}-UserPoolClientId
+
+  ApiEndpoint:
+    Description: API Gateway Endpoint
+    Value: !Sub https://${EcommerceAPI}.execute-api.${AWS::Region}.amazonaws.com/prod
+    Export:
+      Name: !Sub ${Environment}-ApiEndpoint
+
+  ProductsTableName:
+    Description: Products DynamoDB Table
+    Value: !Ref ProductsTable
+    Export:
+      Name: !Sub ${Environment}-ProductsTable
+
+  OrdersTableName:
+    Description: Orders DynamoDB Table
+    Value: !Ref OrdersTable
+    Export:
+      Name: !Sub ${Environment}-OrdersTable
+
+  OrderQueueUrl:
+    Description: SQS Queue URL
+    Value: !Ref OrderQueue
+    Export:
+      Name: !Sub ${Environment}-OrderQueue

@@ -1,0 +1,14 @@
+[
+  {
+    "ParameterKey": "AdminEmail",
+    "ParameterValue": "admin@example.com"
+  },
+  {
+    "ParameterKey": "FromEmail",
+    "ParameterValue": "noreply@example.com"
+  },
+  {
+    "ParameterKey": "Environment",
+    "ParameterValue": "prod"
+  }
+]
