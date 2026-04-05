@@ -10,8 +10,10 @@ sam deploy \
   --stack-name ecommerce-backend \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
-    AdminEmail=admin@example.com \
+    AdminEmail=omarfesal4296@gmail.com \
     FromEmail=noreply@example.com \
+  --s3-bucket=dev-ecommerce-products-747639504940 \
+  --no-resolve-s3 \
   --tags Project=ECommerce Environment=Production
 
 # Get outputs
