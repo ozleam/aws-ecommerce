@@ -351,7 +351,7 @@ Resources:
       CodeUri: ../services/orders/
       Handler: order_worker.lambda_handler
       Policies:
-        - DynamoDBUpdatePolicy:
+        - DynamoDBWritePolicy:
             TableName: !Ref OrdersTable
         - StepFunctionsExecutionPolicy:
             StateMachineName: !Ref OrderProcessingStateMachine
